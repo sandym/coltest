@@ -6,6 +6,7 @@
 #include <string>
 #include <set>
 #include <unordered_map>
+#include <array>
 #include <chrono>
 #include <absl/random/random.h>
 #include <absl/container/btree_map.h>
@@ -19,8 +20,12 @@ template<typename T,size_t N>
 class IndexedDict
 {
 private:
-	uint32_t _lookup[(N+31)/32]{};
+	using lookup_storage_t = unsigned long long;
+	static constexpr std::size_t kBitsPerWord = sizeof(lookup_storage_t) * 8;
+	static constexpr std::size_t kLookupSize = (N+(kBitsPerWord-1)) / kBitsPerWord;
+	std::array<lookup_storage_t, kLookupSize> _lookup{};
 	std::vector<T> _data;
+	
 public:
 	using const_iterator = typename std::vector<T>::const_iterator;
 
@@ -29,11 +34,31 @@ public:
 	void emplace( int k, const T &v )
 	{
 		// find the word
-		// find the bit
-		// if set return
+		auto w = k / kBitsPerWord;
+		if ( w >= _lookup.size() )
+			return;
 
+		// find the bit
+		auto b = k & (kBitsPerWord - 1ULL);
+
+		// if set return
+		if ( _lookup[w]&(1ULL<<b) )
+			return;
+
+		// find the index
+		int idx = 0;
+		for ( int i = 0; i < w; ++i )
+			idx += absl::popcount( _lookup[i] );
+		idx += absl::popcount( _lookup[w]&((1ULL<<b)-1ULL) );
+
+		_data.insert( _data.begin() + idx, v );
+		_lookup[w] |= (1ULL<<b);
 	}
 
+	const_iterator begin() const
+	{
+		return _data.begin();
+	}
 	const_iterator end() const
 	{
 		return _data.end();
@@ -41,7 +66,25 @@ public:
 
 	const_iterator find( int k ) const
 	{
-		return _data.end();
+		// find the word
+		auto w = k / kBitsPerWord;
+		if ( w >= _lookup.size() )
+			return _data.end();
+
+		// find the bit
+		auto b = k & (kBitsPerWord - 1ULL);
+
+		// if not set return
+		if ( (_lookup[w]&(1ULL<<b)) == 0 )
+			return _data.end();
+
+		// find the index
+		int idx = 0;
+		for ( int i = 0; i < w; ++i )
+			idx += absl::popcount( _lookup[i] );
+		idx += absl::popcount( _lookup[w]&((1ULL<<b)-1ULL) );
+
+		return _data.begin() + idx;
 	}
 };
 
@@ -71,7 +114,10 @@ auto print( std::chrono::high_resolution_clock::duration d )
 	if ( ms >= 10 )
 		return std::to_string( ms ) + "ms";
 	auto us = std::chrono::duration_cast<std::chrono::microseconds>( d ).count();
-	return std::to_string( us ) + "us";
+	if ( us >= 10 )
+		return std::to_string( us ) + "us";
+	auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>( d ).count();
+	return std::to_string( ns ) + "ns";
 }
 
 void randomizeHeap( std::vector<std::unique_ptr<char[]>> &randomAllocs )
@@ -106,7 +152,7 @@ void test(
 	const char *text,
 	int nb,
 	const std::vector<std::string> &allAttributes,
-	const RANDOM_KEY &random_key )
+	RANDOM_KEY random_key )
 {
 	// test: lookup speed, insert speed, copy speed, memory
 	std::cout << "==========================================" << std::endl;
@@ -148,6 +194,12 @@ void test(
 
 	time = std::chrono::high_resolution_clock::now() - start;
 	std::cout << "lookup time = " << print( time ) << std::endl;
+
+	start = std::chrono::high_resolution_clock::now();
+	for ( auto &it : container )
+		++found;
+	time = std::chrono::high_resolution_clock::now() - start;
+	std::cout << "iteration = " << print( time ) << std::endl;
 }
 
 int main( int argc, char **argv )
@@ -156,24 +208,31 @@ int main( int argc, char **argv )
 
 	auto random_string_key = [&]
 	{
-		return allAttributes[absl::Uniform<size_t>( g_bitgen, 0, allAttributes.size() - 1 )];
+		return allAttributes[absl::Uniform<size_t>( g_bitgen, 0, allAttributes.size() )];
 	};
-	auto random_int_key = [&]
+	auto random_int_key = [&]( int nb )
 	{
-		return absl::Uniform<size_t>( g_bitgen, 0, allAttributes.size() - 1 );
+		return [&, max = nb, nb = nb]() mutable
+			{
+				if ( nb == 0 )
+					nb = max;
+				return --nb;
+			};
 	};
 
-	test<IndexedDict<std::string,10>>( "IndexedDict", 10, allAttributes, random_int_key );
-	test<IndexedDict<std::string,100>>( "IndexedDict", 100, allAttributes, random_int_key );
-	test<IndexedDict<std::string,1000>>( "IndexedDict", 1000, allAttributes, random_int_key );
-	test<IndexedDict<std::string,100'000>>( "IndexedDict", 100'000, allAttributes, random_int_key );
+	test<IndexedDict<std::string,10>>( "IndexedDict", 10, allAttributes, random_int_key(10) );
+	test<IndexedDict<std::string,100>>( "IndexedDict", 100, allAttributes, random_int_key(100) );
+	test<IndexedDict<std::string,1000>>( "IndexedDict", 1000, allAttributes, random_int_key(1000) );
+	test<IndexedDict<std::string,3000>>( "IndexedDict", 3000, allAttributes, random_int_key(3000) );
+	test<IndexedDict<std::string,100'000>>( "IndexedDict", 100'000, allAttributes, random_int_key(100'000) );
 
-	for ( auto nb : { 10, 100, 1000, 100'000 } )
+	for ( auto nb : { 10, 100, 1000, 3000, 100'000 } )
 	{
 		test<std::map<std::string,std::string>>( "std::map", nb, allAttributes, random_string_key );
-		test<std::map<int,std::string>>( "std::map2", nb, allAttributes, random_int_key );
+		test<std::map<int,std::string>>( "std::map2", nb, allAttributes, random_int_key( nb ) );
 		test<std::unordered_map<std::string,std::string>>( "std::unordered_map", nb, allAttributes, random_string_key );
 		test<absl::btree_map<std::string,std::string>>( "btree_map", nb, allAttributes, random_string_key );
+		test<absl::btree_map<int,std::string>>( "btree_map2", nb, allAttributes, random_int_key(nb) );
 		test<absl::flat_hash_map<std::string,std::string>>( "flat_hash_map", nb, allAttributes, random_string_key );
 	}
 
